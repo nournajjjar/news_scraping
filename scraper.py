@@ -1,77 +1,90 @@
 # scraper.py
 import os
-import requests
-from bs4 import BeautifulSoup
+from datetime import datetime
+import feedparser
 import mysql.connector
 from mysql.connector import errorcode
-from datetime import datetime
-import time
-import feedparser
+from dotenv import load_dotenv
 
-# ---- Configuration (read from environment) ----
+# ---- Load environment variables from .env ----
+load_dotenv()
+
 DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD"),
-    "database": os.getenv("DB_NAME")
+    "database": os.getenv("DB_NAME"),
+    "port": int(os.getenv("DB_PORT", 3306))
 }
+try:
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    print("✅ Connected to cloud DB!")
+except mysql.connector.Error as err:
+    print("❌ Connection failed:", err)
+    
 
-FRANCE24_URL = "https://www.france24.com/fr/"
+# ---- France24 RSS feeds ----
+FRANCE24_FEEDS = [
+    "https://www.france24.com/fr/rss",
+    "https://www.france24.com/fr/afrique/rss",
+    "https://www.france24.com/fr/europe/rss",
+    "https://www.france24.com/fr/économie/rss",
+]
 
-# ---- Fetch and parse France24 homepage ----
-
-
-
-
+# ---- Fetch articles from France24 ----
 def fetch_france24():
-    feeds = [
-        "https://www.france24.com/fr/rss",
-        "https://www.france24.com/fr/afrique/rss",
-        "https://www.france24.com/fr/europe/rss",
-        "https://www.france24.com/fr/économie/rss",
-    ]
-
     articles = []
-    for feed_url in feeds:
+    for feed_url in FRANCE24_FEEDS:
         feed = feedparser.parse(feed_url)
         for entry in feed.entries:
             articles.append({
                 "title": entry.title,
                 "link": entry.link,
-                "category": feed.feed.title
+                "summary": entry.get("summary", ""),  # summary/description
+                "category": feed.feed.get("title", "")
             })
     return articles
 
+# ---- Save articles to MySQL, skip duplicates using UNIQUE index ----
+def save_to_mysql(articles):
+    import mysql.connector
 
-
-# ---- Save to MySQL, skip duplicates using UNIQUE index ----
-def save_to_mysql(items):
+    # Optional: sanity check
     if not DB_CONFIG["host"]:
-        raise RuntimeError("DB_HOST is not set in environment variables.")
-    conn = None
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        insert_sql = """
-            INSERT INTO france24_articles (title, link, category)
-            VALUES (%s, %s, %s)
-        """
-        for item in items:
-            try:
-                cursor.execute(insert_sql, (item["title"], item["link"], item["category"]))
-            except mysql.connector.IntegrityError as e:
-                # Duplicate link -> skip
-                if e.errno == errorcode.ER_DUP_ENTRY:
-                    # optional: update scraped_at if desired
-                    continue
-                else:
-                    raise
-        conn.commit()
-        cursor.close()
-    finally:
-        if conn:
-            conn.close()
+        print("DB host not set!")
+        return
 
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+
+    # Create table if it doesn't exist
+    create_table_sql = """
+    CREATE TABLE IF NOT EXISTS france24_articles (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        title VARCHAR(500),
+        link VARCHAR(1000),
+        summary TEXT,
+        category VARCHAR(255),
+        published_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    cursor.execute(create_table_sql)
+
+    insert_sql = """
+    INSERT INTO france24_articles (title, link, summary, category)
+    VALUES (%s, %s, %s, %s)
+    """
+    for item in articles:
+        cursor.execute(insert_sql, (item["title"], item["link"], item["summary"], item["category"]))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print("✅ Articles saved to MySQL!")
+
+
+# ---- Main execution ----
 if __name__ == "__main__":
     try:
         articles = fetch_france24()
